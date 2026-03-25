@@ -13,15 +13,17 @@
     <script src="https://unpkg.com/html5-qrcode"></script>
     <style>
         .book-card:active { transform: scale(0.98); }
-        .line-clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+        .line-clamp-3 { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+        .animate-fadeIn { animation: fadeIn 0.3s ease-out forwards; }
     </style>
 </head>
-<body class="bg-gray-100 p-2 md:p-8 text-gray-800">
+<body class="bg-gray-100 p-2 md:p-8 text-gray-800 font-sans">
     <div id="root"></div>
 
     <script type="text/babel">
         const firebaseConfig = {
-            apiKey: "AIzaSyBoTsM4_uPCEq272h7oasm-Ekh362AbRlY",
+            apiKey: "AIzaSyBoTsM4_uPCE?q272h7oasm-Ekh362AbRlY",
             authDomain: "books-e26df.firebaseapp.com",
             projectId: "books-e26df",
             storageBucket: "books-e26df.firebasestorage.app",
@@ -40,112 +42,121 @@
             const [isScanning, setIsScanning] = useState(false);
             const [msg, setMsg] = useState("");
             const [expandedId, setExpandedId] = useState(null);
+            const [isUpdating, setIsUpdating] = useState(false);
 
             useEffect(() => {
                 const unsubscribe = db.collection("books").orderBy("updatedAt", "desc").onSnapshot(s => {
-                    const loadedBooks = s.docs.map(d => ({ id: d.id, ...d.data() }));
-                    setBooks(loadedBooks);
-                    
-                    // 既存データの中で、画像または詳細が欠けているものを自動修復する
-                    loadedBooks.forEach(book => {
-                        if (book.isbn && (!book.thumbnail || !book.description)) {
-                            autoRepairBook(book);
-                        }
-                    });
+                    setBooks(s.docs.map(d => ({ id: d.id, ...d.data() })));
                 });
                 return () => unsubscribe();
             }, []);
 
-            // 外部ソースからの画像補完用URL生成
-            const getAlternativeThumbnail = (isbn) => {
+            // 画像URLのフォールバック生成
+            const generateImageUrls = (isbn) => {
                 if (!isbn) return "";
                 const clean = isbn.replace(/\D/g, "");
+                // 優先度1: 版元ドットコム, 優先度2: Google Books, 優先度3: OpenLibrary
                 return `https://v3.books.or.jp/api/v1/image/isbn/${clean}`;
             };
 
-            // 既存データの自動修復ロジック
-            const autoRepairBook = async (book) => {
-                const cleanIsbn = book.isbn.replace(/\D/g, "");
-                if (cleanIsbn.length < 10) return;
-
+            // 国立国会図書館 (NDL) 検索ロジック
+            const fetchNDL = async (isbn) => {
                 try {
-                    // OpenBD
-                    const res = await fetch(`https://api.openbd.jp/v1/get?isbn=${cleanIsbn}`);
-                    const data = await res.json();
-                    
-                    let updateData = {};
+                    const res = await fetch(`https://iss.ndl.go.jp/api/opensearch?isbn=${isbn}`);
+                    const text = await res.text();
+                    const parser = new DOMParser();
+                    const xml = parser.parseFromString(text, "text/xml");
+                    const item = xml.querySelector("item");
+                    if (item) {
+                        return {
+                            title: item.querySelector("title")?.textContent || "",
+                            author: item.querySelector("author")?.textContent || "",
+                            description: item.querySelector("description")?.textContent || ""
+                        };
+                    }
+                } catch (e) { console.error("NDL Error", e); }
+                return null;
+            };
 
-                    if (data && data.length > 0 && data[0] !== null) {
-                        const sum = data[0].summary;
-                        const detail = data[0].onix?.CollateralDetail?.TextContent?.[0]?.Text || "";
-                        if (!book.thumbnail) updateData.thumbnail = sum.cover || getAlternativeThumbnail(cleanIsbn);
-                        if (!book.description) updateData.description = detail || "";
-                    } else {
-                        // Google Books
+            const fetchFullBookInfo = async (isbn) => {
+                const cleanIsbn = isbn.replace(/\D/g, "");
+                if (cleanIsbn.length < 10) return null;
+
+                let result = { title: '', author: '', isbn: cleanIsbn, thumbnail: '', description: '' };
+
+                // 1. OpenBD (最速・高精度)
+                try {
+                    const obdRes = await fetch(`https://api.openbd.jp/v1/get?isbn=${cleanIsbn}`);
+                    const obdData = await obdRes.json();
+                    if (obdData?.[0]) {
+                        const s = obdData[0].summary;
+                        result.title = s.title;
+                        result.author = s.author;
+                        result.thumbnail = s.cover;
+                        result.description = obdData[0].onix?.CollateralDetail?.TextContent?.[0]?.Text || "";
+                    }
+                } catch (e) {}
+
+                // 2. NDL (日本の本ならほぼある)
+                if (!result.title) {
+                    const ndlData = await fetchNDL(cleanIsbn);
+                    if (ndlData) {
+                        result.title = ndlData.title;
+                        result.author = ndlData.author;
+                        result.description = ndlData.description;
+                    }
+                }
+
+                // 3. Google Books
+                if (!result.title || !result.thumbnail || !result.description) {
+                    try {
                         const gbRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${cleanIsbn}`);
                         const gbData = await gbRes.json();
-                        if (gbData.items && gbData.items.length > 0) {
+                        if (gbData.items?.[0]) {
                             const info = gbData.items[0].volumeInfo;
-                            if (!book.thumbnail) updateData.thumbnail = info.imageLinks?.thumbnail?.replace('http:', 'https:') || getAlternativeThumbnail(cleanIsbn);
-                            if (!book.description) updateData.description = info.description || "";
+                            if (!result.title) result.title = info.title;
+                            if (!result.author) result.author = info.authors?.join(", ");
+                            if (!result.thumbnail) result.thumbnail = info.imageLinks?.thumbnail?.replace('http:', 'https:');
+                            if (!result.description) result.description = info.description;
                         }
-                    }
+                    } catch (e) {}
+                }
 
-                    // 何かしら補完できるデータがあれば更新
-                    if (Object.keys(updateData).length > 0) {
-                        await db.collection("books").doc(book.id).update(updateData);
-                    }
-                } catch (e) {
-                    console.error("Auto repair failed for", book.title, e);
+                // 画像がどうしても無い場合の最終手段
+                if (!result.thumbnail) {
+                    result.thumbnail = generateImageUrls(cleanIsbn);
+                }
+
+                return result;
+            };
+
+            const handleSearch = async (isbn) => {
+                setMsg("多重データベースを照合中...");
+                const info = await fetchFullBookInfo(isbn);
+                if (info && info.title) {
+                    setNewBook(info);
+                    setMsg(`「${info.title}」の情報を取得しました`);
+                } else if (info) {
+                    setNewBook(info);
+                    setMsg("タイトルが見つかりませんでした。手入力してください。");
+                } else {
+                    setMsg("エラーが発生しました。");
                 }
             };
 
-            const fetchBookInfo = async (isbn) => {
-                const cleanIsbn = isbn.replace(/\D/g, "");
-                if (cleanIsbn.length < 10) {
-                    setMsg("ISBNは10桁または13桁の数字です");
-                    return;
+            const handleManualRepair = async (book) => {
+                setIsUpdating(true);
+                setMsg(`${book.title} を再スキャン中...`);
+                const info = await fetchFullBookInfo(book.isbn);
+                if (info) {
+                    await db.collection("books").doc(book.id).update({
+                        thumbnail: info.thumbnail || book.thumbnail || "",
+                        description: info.description || book.description || "",
+                        author: info.author || book.author || ""
+                    });
+                    setMsg("情報を更新しました。");
                 }
-                setMsg("データベースを検索中...");
-                try {
-                    const openBdRes = await fetch(`https://api.openbd.jp/v1/get?isbn=${cleanIsbn}`);
-                    const openBdData = await openBdRes.json();
-                    if (openBdData && openBdData.length > 0 && openBdData[0] !== null) {
-                        const sum = openBdData[0].summary;
-                        const detail = openBdData[0].onix?.CollateralDetail?.TextContent?.[0]?.Text || "";
-                        setNewBook({
-                            title: sum.title || "",
-                            author: sum.author || "",
-                            isbn: cleanIsbn,
-                            thumbnail: sum.cover || getAlternativeThumbnail(cleanIsbn),
-                            description: detail || "内容紹介はありません。"
-                        });
-                        setMsg(`「${sum.title}」を取得しました`);
-                        return;
-                    }
-                    let gbRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${cleanIsbn}`);
-                    let gbData = await gbRes.json();
-                    if (!gbData.items || gbData.items.length === 0) {
-                        gbRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${cleanIsbn}`);
-                        gbData = await gbRes.json();
-                    }
-                    if (gbData.items && gbData.items.length > 0) {
-                        const info = gbData.items[0].volumeInfo;
-                        setNewBook({
-                            title: info.title || "",
-                            author: info.authors ? info.authors.join(", ") : "",
-                            isbn: cleanIsbn,
-                            thumbnail: info.imageLinks?.thumbnail?.replace('http:', 'https:') || getAlternativeThumbnail(cleanIsbn),
-                            description: info.description || "内容紹介はありません。"
-                        });
-                        setMsg(`「${info.title}」を取得しました`);
-                        return;
-                    }
-                    setMsg("データが見つかりませんでした。画像のみ補完を試みます。");
-                    setNewBook(p => ({ ...p, isbn: cleanIsbn, thumbnail: getAlternativeThumbnail(cleanIsbn), description: '' }));
-                } catch (err) {
-                    setMsg("通信エラーが発生しました。");
-                }
+                setIsUpdating(false);
             };
 
             const startScanner = () => {
@@ -153,20 +164,14 @@
                 setMsg("");
                 setTimeout(() => {
                     const scanner = new Html5Qrcode("reader");
-                    scanner.start(
-                        { facingMode: "environment" },
-                        { fps: 15, qrbox: { width: 280, height: 160 } },
-                        (text) => {
-                            if (text.startsWith("978") && text.length === 13) {
-                                scanner.stop().then(() => {
-                                    setIsScanning(false);
-                                    setNewBook(p => ({ ...p, isbn: text }));
-                                    fetchBookInfo(text);
-                                });
-                            }
-                        },
-                        () => {}
-                    ).catch(() => setIsScanning(false));
+                    scanner.start({ facingMode: "environment" }, { fps: 15, qrbox: { width: 280, height: 160 } }, (text) => {
+                        if (text.startsWith("978") && text.length === 13) {
+                            scanner.stop().then(() => {
+                                setIsScanning(false);
+                                handleSearch(text);
+                            });
+                        }
+                    }, () => {}).catch(() => setIsScanning(false));
                 }, 200);
             };
 
@@ -180,7 +185,7 @@
                     updatedAt: firebase.firestore.FieldValue.serverTimestamp()
                 });
                 setNewBook({ title: '', author: '', isbn: '', thumbnail: '', description: '' });
-                setMsg("登録完了しました！");
+                setMsg("登録しました！");
             };
 
             const toggleStatus = async (book) => {
@@ -194,112 +199,130 @@
             };
 
             const deleteBook = async (id, title) => {
-                if (confirm(`「${title}」をリストから完全に削除しますか？`)) {
+                if (confirm(`「${title}」を完全に削除しますか？`)) {
                     await db.collection("books").doc(id).delete();
-                    setMsg("削除しました。");
                 }
             };
 
             return (
                 <div className="max-w-md mx-auto p-2 pb-20">
-                    <h1 className="text-xl font-bold mb-4 bg-blue-700 text-white p-4 rounded shadow-lg text-center">
-                        東京公社住宅サービス<br/><span className="text-sm font-normal">書籍管理システム</span>
-                    </h1>
+                    <header className="mb-6 bg-gradient-to-r from-blue-700 to-blue-900 text-white p-5 rounded-2xl shadow-xl text-center">
+                        <h1 className="text-xl font-bold tracking-tight">東京公社住宅サービス</h1>
+                        <p className="text-xs opacity-80 mt-1 uppercase tracking-widest font-light">Books Management System</p>
+                    </header>
                     
-                    <div className="bg-white p-4 rounded shadow mb-4 border-t-4 border-blue-500">
-                        <div className="flex justify-between items-center mb-4">
-                            <h2 className="font-bold text-gray-700">📖 新しい本を登録</h2>
-                            <button onClick={startScanner} className="bg-orange-500 text-white px-4 py-2 rounded-full text-sm font-bold shadow flex items-center gap-1">
-                                <span>📷</span> スキャン
+                    <div className="bg-white p-5 rounded-2xl shadow-md mb-6 border border-gray-100">
+                        <div className="flex justify-between items-center mb-5">
+                            <h2 className="font-bold text-gray-800 flex items-center gap-2 text-lg">
+                                <span className="text-blue-600 text-2xl">⊕</span> 書籍登録
+                            </h2>
+                            <button onClick={startScanner} className="bg-orange-500 hover:bg-orange-600 text-white px-5 py-2 rounded-full text-sm font-bold shadow-lg transition-all flex items-center gap-2">
+                                📷 バーコード
                             </button>
                         </div>
 
                         {isScanning && (
-                            <div className="fixed inset-0 bg-black z-50 flex flex-col items-center justify-center p-4 text-center">
-                                <div id="reader" className="w-full max-w-sm bg-white rounded overflow-hidden border-4 border-white"></div>
-                                <button onClick={() => location.reload()} className="mt-8 bg-white px-10 py-3 rounded-full font-bold">閉じる</button>
-                                <p className="text-white mt-4 font-bold">ISBNバーコードを枠内へ</p>
+                            <div className="fixed inset-0 bg-black/90 z-50 flex flex-col items-center justify-center p-4">
+                                <div id="reader" className="w-full max-w-sm bg-white rounded-xl overflow-hidden shadow-2xl border-4 border-blue-500"></div>
+                                <button onClick={() => location.reload()} className="mt-8 bg-red-500 text-white px-12 py-3 rounded-full font-bold shadow-xl">キャンセル</button>
                             </div>
                         )}
 
-                        <form onSubmit={handleAdd} className="space-y-3">
+                        <form onSubmit={handleAdd} className="space-y-4">
                             <div className="flex gap-2">
-                                <input className="flex-1 border p-2 rounded text-sm bg-gray-50 focus:bg-white focus:ring-2 focus:ring-blue-400 outline-none" placeholder="ISBN (13桁)" value={newBook.isbn} 
+                                <input className="flex-1 border-2 border-gray-100 p-3 rounded-xl text-sm focus:border-blue-500 outline-none transition-all" placeholder="ISBN (13桁)" value={newBook.isbn} 
                                     onChange={e => {
                                         const v = e.target.value;
                                         setNewBook({...newBook, isbn: v});
-                                        if(v.replace(/\D/g, "").length === 13) fetchBookInfo(v);
+                                        if(v.replace(/\D/g, "").length === 13) handleSearch(v);
                                     }} 
                                 />
-                                <button type="button" onClick={() => fetchBookInfo(newBook.isbn)} className="bg-blue-100 text-blue-700 px-4 py-2 rounded font-bold text-sm">検索</button>
+                                <button type="button" onClick={() => handleSearch(newBook.isbn)} className="bg-blue-50 text-blue-700 px-4 rounded-xl font-bold text-sm border border-blue-100">検索</button>
                             </div>
                             
                             {newBook.thumbnail && (
-                                <div className="flex justify-center p-3 bg-gray-50 rounded border border-dashed border-gray-300">
-                                    <div className="text-center">
-                                        <img src={newBook.thumbnail} alt="cover" className="h-40 shadow-xl rounded mx-auto mb-1" onError={(e)=>{e.target.style.display='none'}} />
-                                        <p className="text-[10px] text-gray-400 italic">プレビュー画像</p>
-                                    </div>
+                                <div className="flex justify-center p-4 bg-gray-50 rounded-2xl border-2 border-dashed border-gray-200 animate-fadeIn">
+                                    <img src={newBook.thumbnail} alt="cover" className="h-44 shadow-2xl rounded-lg border-4 border-white" onError={(e)=>{e.target.style.display='none'}} />
                                 </div>
                             )}
 
-                            <input className="w-full border p-2 rounded text-sm focus:ring-2 focus:ring-blue-400 outline-none" placeholder="書籍タイトル" value={newBook.title} onChange={e => setNewBook({...newBook, title: e.target.value})} required />
-                            <input className="w-full border p-2 rounded text-sm focus:ring-2 focus:ring-blue-400 outline-none" placeholder="著者名" value={newBook.author} onChange={e => setNewBook({...newBook, author: e.target.value})} />
+                            <div className="space-y-2">
+                                <input className="w-full border-2 border-gray-100 p-3 rounded-xl text-sm focus:border-blue-500 outline-none transition-all" placeholder="書籍タイトル (必須)" value={newBook.title} onChange={e => setNewBook({...newBook, title: e.target.value})} required />
+                                <input className="w-full border-2 border-gray-100 p-3 rounded-xl text-sm focus:border-blue-500 outline-none transition-all" placeholder="著者名" value={newBook.author} onChange={e => setNewBook({...newBook, author: e.target.value})} />
+                            </div>
                             
-                            {msg && <p className="text-xs text-blue-600 font-bold bg-blue-50 p-2 rounded border border-blue-100">{msg}</p>}
-                            <button className="w-full bg-blue-700 text-white py-3 rounded font-bold shadow-lg active:bg-blue-800">リストに追加する</button>
+                            {msg && <div className="text-xs text-blue-700 font-bold bg-blue-50 p-3 rounded-xl border border-blue-100 animate-fadeIn">{msg}</div>}
+                            <button className="w-full bg-blue-700 hover:bg-blue-800 text-white py-4 rounded-xl font-bold shadow-lg transition-all transform active:scale-[0.98]">
+                                リストに登録する
+                            </button>
                         </form>
                     </div>
 
-                    <div className="space-y-3">
+                    <div className="space-y-4">
+                        <div className="flex items-center justify-between px-2">
+                            <h3 className="font-bold text-gray-500 text-sm">登録書籍一覧 ({books.length}冊)</h3>
+                        </div>
                         {books.map(book => (
-                            <div key={book.id} className="bg-white rounded shadow-sm border border-gray-200 overflow-hidden transition-all book-card">
-                                <div className="p-3 flex justify-between items-start gap-3 cursor-pointer" onClick={() => setExpandedId(expandedId === book.id ? null : book.id)}>
-                                    <div className="flex gap-3 overflow-hidden flex-1">
-                                        <div className="w-14 h-20 bg-gray-100 rounded shadow-inner flex-shrink-0 overflow-hidden border border-gray-100 flex items-center justify-center">
-                                            {book.thumbnail ? (
-                                                <img src={book.thumbnail} className="w-full h-full object-cover" alt="thumb" onError={(e)=>{e.target.src='https://placehold.jp/24/cccccc/ffffff/150x200.png?text=No%20Image'}} />
-                                            ) : (
-                                                <span className="text-[10px] text-gray-400">Loading...</span>
-                                            )}
-                                        </div>
-                                        <div className="overflow-hidden flex flex-col justify-center">
-                                            <div className="font-bold text-sm text-gray-800 leading-tight mb-1">{book.title}</div>
-                                            <div className="text-xs text-gray-500 truncate">{book.author}</div>
-                                            {book.borrower && (
-                                                <div className="inline-flex items-center text-[10px] text-red-600 font-bold mt-2 bg-red-50 px-2 py-0.5 rounded border border-red-100 w-fit">
-                                                    👤 借用中: {book.borrower}
-                                                </div>
-                                            )}
-                                        </div>
+                            <div key={book.id} className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden book-card transition-all">
+                                <div className="p-4 flex gap-4 cursor-pointer" onClick={() => setExpandedId(expandedId === book.id ? null : book.id)}>
+                                    <div className="w-16 h-24 bg-gray-100 rounded-lg shadow-inner flex-shrink-0 overflow-hidden border border-gray-50 flex items-center justify-center">
+                                        {book.thumbnail ? (
+                                            <img src={book.thumbnail} className="w-full h-full object-cover" alt="thumb" onError={(e)=>{e.target.src='https://placehold.jp/24/cccccc/ffffff/150x200.png?text=No%20Cover'}} />
+                                        ) : (
+                                            <span className="text-[10px] text-gray-400">No Image</span>
+                                        )}
                                     </div>
-                                    <div className="flex flex-col items-end gap-3 flex-shrink-0">
-                                        <div className="flex items-center gap-1">
-                                            <button onClick={(e) => { e.stopPropagation(); deleteBook(book.id, book.title); }} className="text-gray-300 hover:text-red-500 p-2 text-lg">🗑️</button>
-                                            <button onClick={(e) => { e.stopPropagation(); toggleStatus(book); }} className={`text-[10px] w-14 py-2 rounded font-bold shadow-sm ${book.status === 'available' ? 'bg-green-600 text-white' : 'bg-gray-100 text-gray-500 border'}`}>
-                                                {book.status === 'available' ? '借りる' : '返却'}
-                                            </button>
+                                    <div className="flex-1 flex flex-col justify-between py-1 overflow-hidden">
+                                        <div>
+                                            <h4 className="font-bold text-sm text-gray-900 leading-snug line-clamp-2">{book.title}</h4>
+                                            <p className="text-xs text-gray-400 mt-1 truncate">{book.author}</p>
                                         </div>
-                                        <span className="text-[10px] font-bold text-blue-500">{expandedId === book.id ? '▲ 閉じる' : '▼ 詳細・内容'}</span>
+                                        <div className="flex items-center justify-between mt-2">
+                                            {book.borrower ? (
+                                                <span className="text-[10px] bg-red-50 text-red-600 px-2 py-1 rounded-full font-bold border border-red-100">👤 {book.borrower}</span>
+                                            ) : (
+                                                <span className="text-[10px] bg-green-50 text-green-600 px-2 py-1 rounded-full font-bold border border-green-100">✓ 貸出可</span>
+                                            )}
+                                            <span className="text-[10px] font-bold text-blue-500">{expandedId === book.id ? '▲ 閉じる' : '詳細 ▼'}</span>
+                                        </div>
                                     </div>
                                 </div>
                                 
                                 {expandedId === book.id && (
-                                    <div className="p-4 border-t bg-blue-50 text-xs leading-relaxed text-gray-700 animate-in slide-in-from-top-2 duration-300">
-                                        <div className="flex flex-col md:flex-row gap-4 italic mb-2 border-b border-blue-100 pb-2">
-                                            <span className="font-bold">ISBN: {book.isbn}</span>
-                                        </div>
-                                        <div className="font-bold mb-2 text-blue-800 flex items-center gap-1">
-                                            <span>📄</span> 内容ダイジェスト
-                                        </div>
-                                        <div className="bg-white p-3 rounded border border-blue-100 shadow-sm whitespace-pre-wrap">
-                                            {book.description || "この書籍の紹介文は登録されていません。"}
-                                        </div>
-                                        {book.thumbnail && (
-                                            <div className="mt-4 flex justify-center">
-                                                <img src={book.thumbnail} className="max-w-[150px] shadow-lg rounded border-2 border-white" alt="Large" />
+                                    <div className="px-4 pb-4 bg-gray-50 border-t border-gray-50 animate-fadeIn text-xs">
+                                        <div className="py-4 space-y-4">
+                                            <div className="flex gap-2">
+                                                <button onClick={() => toggleStatus(book)} className={`flex-1 py-3 rounded-xl font-bold shadow-sm transition-all ${book.status === 'available' ? 'bg-green-600 text-white' : 'bg-gray-200 text-gray-600'}`}>
+                                                    {book.status === 'available' ? 'この本を借りる' : '返却する'}
+                                                </button>
+                                                <button onClick={() => deleteBook(book.id, book.title)} className="bg-red-50 text-red-500 px-4 rounded-xl border border-red-100">🗑</button>
                                             </div>
-                                        )}
+
+                                            <div className="bg-white p-4 rounded-xl border border-gray-200 shadow-sm">
+                                                <div className="flex justify-between items-center mb-2">
+                                                    <span className="font-bold text-gray-700 flex items-center gap-1">📄 内容紹介</span>
+                                                    <button 
+                                                        onClick={() => handleManualRepair(book)}
+                                                        className="text-[10px] text-blue-600 bg-blue-50 px-2 py-1 rounded border border-blue-100 hover:bg-blue-100 transition-all"
+                                                        disabled={isUpdating}
+                                                    >
+                                                        {isUpdating ? "更新中..." : "🔄 最新情報に更新"}
+                                                    </button>
+                                                </div>
+                                                <p className="text-gray-600 leading-relaxed whitespace-pre-wrap">
+                                                    {book.description || "書籍の紹介文がありません。情報の更新をお試しください。"}
+                                                </p>
+                                                <div className="mt-4 pt-3 border-t border-gray-100 flex justify-between text-[10px] text-gray-400">
+                                                    <span>ISBN: {book.isbn}</span>
+                                                </div>
+                                            </div>
+
+                                            {book.thumbnail && (
+                                                <div className="flex justify-center">
+                                                    <img src={book.thumbnail} className="max-w-[180px] shadow-2xl rounded-xl border-4 border-white" alt="Large" />
+                                                </div>
+                                            )}
+                                        </div>
                                     </div>
                                 )}
                             </div>
