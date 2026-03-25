@@ -43,17 +43,61 @@
 
             useEffect(() => {
                 const unsubscribe = db.collection("books").orderBy("updatedAt", "desc").onSnapshot(s => {
-                    setBooks(s.docs.map(d => ({ id: d.id, ...d.data() })));
+                    const loadedBooks = s.docs.map(d => ({ id: d.id, ...d.data() }));
+                    setBooks(loadedBooks);
+                    
+                    // 既存データの中で、画像または詳細が欠けているものを自動修復する
+                    loadedBooks.forEach(book => {
+                        if (book.isbn && (!book.thumbnail || !book.description)) {
+                            autoRepairBook(book);
+                        }
+                    });
                 });
                 return () => unsubscribe();
             }, []);
 
-            // 画像の補完ロジック：APIに画像がない場合に他のソースを試す
+            // 外部ソースからの画像補完用URL生成
             const getAlternativeThumbnail = (isbn) => {
                 if (!isbn) return "";
                 const clean = isbn.replace(/\D/g, "");
-                // 版元ドットコムの画像サーバーを利用（日本の書籍に強い）
                 return `https://v3.books.or.jp/api/v1/image/isbn/${clean}`;
+            };
+
+            // 既存データの自動修復ロジック
+            const autoRepairBook = async (book) => {
+                const cleanIsbn = book.isbn.replace(/\D/g, "");
+                if (cleanIsbn.length < 10) return;
+
+                try {
+                    // OpenBD
+                    const res = await fetch(`https://api.openbd.jp/v1/get?isbn=${cleanIsbn}`);
+                    const data = await res.json();
+                    
+                    let updateData = {};
+
+                    if (data && data.length > 0 && data[0] !== null) {
+                        const sum = data[0].summary;
+                        const detail = data[0].onix?.CollateralDetail?.TextContent?.[0]?.Text || "";
+                        if (!book.thumbnail) updateData.thumbnail = sum.cover || getAlternativeThumbnail(cleanIsbn);
+                        if (!book.description) updateData.description = detail || "";
+                    } else {
+                        // Google Books
+                        const gbRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${cleanIsbn}`);
+                        const gbData = await gbRes.json();
+                        if (gbData.items && gbData.items.length > 0) {
+                            const info = gbData.items[0].volumeInfo;
+                            if (!book.thumbnail) updateData.thumbnail = info.imageLinks?.thumbnail?.replace('http:', 'https:') || getAlternativeThumbnail(cleanIsbn);
+                            if (!book.description) updateData.description = info.description || "";
+                        }
+                    }
+
+                    // 何かしら補完できるデータがあれば更新
+                    if (Object.keys(updateData).length > 0) {
+                        await db.collection("books").doc(book.id).update(updateData);
+                    }
+                } catch (e) {
+                    console.error("Auto repair failed for", book.title, e);
+                }
             };
 
             const fetchBookInfo = async (isbn) => {
@@ -62,14 +106,10 @@
                     setMsg("ISBNは10桁または13桁の数字です");
                     return;
                 }
-                
                 setMsg("データベースを検索中...");
-                
                 try {
-                    // 1. OpenBD API
                     const openBdRes = await fetch(`https://api.openbd.jp/v1/get?isbn=${cleanIsbn}`);
                     const openBdData = await openBdRes.json();
-                    
                     if (openBdData && openBdData.length > 0 && openBdData[0] !== null) {
                         const sum = openBdData[0].summary;
                         const detail = openBdData[0].onix?.CollateralDetail?.TextContent?.[0]?.Text || "";
@@ -83,16 +123,12 @@
                         setMsg(`「${sum.title}」を取得しました`);
                         return;
                     }
-
-                    // 2. Google Books API
                     let gbRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=isbn:${cleanIsbn}`);
                     let gbData = await gbRes.json();
-                    
                     if (!gbData.items || gbData.items.length === 0) {
                         gbRes = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${cleanIsbn}`);
                         gbData = await gbRes.json();
                     }
-
                     if (gbData.items && gbData.items.length > 0) {
                         const info = gbData.items[0].volumeInfo;
                         setNewBook({
@@ -105,10 +141,8 @@
                         setMsg(`「${info.title}」を取得しました`);
                         return;
                     }
-
                     setMsg("データが見つかりませんでした。画像のみ補完を試みます。");
                     setNewBook(p => ({ ...p, isbn: cleanIsbn, thumbnail: getAlternativeThumbnail(cleanIsbn), description: '' }));
-
                 } catch (err) {
                     setMsg("通信エラーが発生しました。");
                 }
@@ -182,7 +216,7 @@
 
                         {isScanning && (
                             <div className="fixed inset-0 bg-black z-50 flex flex-col items-center justify-center p-4 text-center">
-                                <div id="reader" className="w-full max-w-sm bg-white rounded overflow-hidden"></div>
+                                <div id="reader" className="w-full max-w-sm bg-white rounded overflow-hidden border-4 border-white"></div>
                                 <button onClick={() => location.reload()} className="mt-8 bg-white px-10 py-3 rounded-full font-bold">閉じる</button>
                                 <p className="text-white mt-4 font-bold">ISBNバーコードを枠内へ</p>
                             </div>
@@ -226,7 +260,7 @@
                                             {book.thumbnail ? (
                                                 <img src={book.thumbnail} className="w-full h-full object-cover" alt="thumb" onError={(e)=>{e.target.src='https://placehold.jp/24/cccccc/ffffff/150x200.png?text=No%20Image'}} />
                                             ) : (
-                                                <span className="text-[10px] text-gray-400">No Image</span>
+                                                <span className="text-[10px] text-gray-400">Loading...</span>
                                             )}
                                         </div>
                                         <div className="overflow-hidden flex flex-col justify-center">
@@ -271,12 +305,6 @@
                             </div>
                         ))}
                     </div>
-                    {books.length === 0 && (
-                        <div className="text-center py-20 text-gray-400">
-                            <p>登録されている本がありません。</p>
-                            <p className="text-sm">上のフォームから登録してください。</p>
-                        </div>
-                    )}
                 </div>
             );
         }
